@@ -1,62 +1,16 @@
-# Planiq Zones — контуры корпусов на генплане ЖК
+# React + Vite
 
-Редактор для Qoshni: загружает генплан ЖК и список корпусов с бэка, даёт обвести каждый
-корпус прямоугольником или полигоном и выгружает контуры в формате `media` бэка.
+This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 
-## Зачем
+Currently, two official plugins are available:
 
-У ЖК на бэке в `media` по id корпуса лежит `{img, shape, coords, …}` — контур корпуса на
-генплане. Заполнять его руками нельзя: цифры должны быть точными и не зависеть от экрана.
-Редактор держит все координаты в **пикселях оригинала картинки** и переводит их в проценты
-только на экспорте — контур ляжет на генплан любого размера.
+- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
+- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
 
-## Запуск
+## React Compiler
 
-```bash
-npm install
-npm run dev        # http://localhost:5173
-npm test           # геометрия и экспорт
-npm run lint
-```
+The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
 
-Адрес бэка по умолчанию — `https://apiv1.qoshni.uz`; другой — `VITE_API_URL` в `.env.local`.
+## Expanding the ESLint configuration
 
-## Как работать
-
-1. Ввести slug ЖК (например `nurafshon-park`) → **Загрузить**. Придут генплан (`media.visual_view`),
-   корпуса (`/blocks`) и уже обведённые контуры, если есть.
-   Нет доступа к бэку — **Картинка** с диска; id корпусов тогда вписываются в зону руками.
-2. Инструменты: **Прямоугольник** — протянуть; **Полигон** — клики по вершинам, клик по первой,
-   Enter или двойной клик замыкает, Esc отменяет; **Выделение** — тянуть зону, ручки
-   прямоугольника, вершины полигона; **Рука** / пробел — таскать холст; колесо — зум; стрелки —
-   сдвиг выделенного на 1 px (Shift — 10); Del — удалить; Ctrl+Z / Ctrl+Y — история.
-3. У каждой зоны выбрать корпус. Панель подсказывает, кто без корпуса и какой корпус без зоны.
-4. **media.json** или **В буфер** — экспорт для бэка. **Сохранить** / **Открыть** — файл проекта,
-   чтобы вернуться к работе (картинка в него не вкладывается).
-
-## Формат экспорта
-
-```json
-{
-  "visual_view": "…",                       // чужие ключи media сохраняются как были
-  "<blockId>": {
-    "img": "self",
-    "shape": "polygon",                     // или "rect"
-    "coords": [[12.34, 20.1], [40, 20.1], [40, 55.5], [12.34, 55.5]],
-    "shape_flr": "rect",
-    "coords_flr": []
-  }
-}
-```
-
-`coords` — точки `[x, y]` в процентах от ширины и высоты генплана (0–100, два знака).
-⚠️ Формат точек бэк пока не объявил (вопрос B-44 в `docs/backend/QUESTIONS.md` сайта); это наше
-предположение. Ответят иначе — менять только `src/lib/exportMedia.js`.
-
-## Структура
-
-- `src/lib/geometry.js` — геометрия зон (пиксели картинки, ручки, проценты), чистая, с тестами.
-- `src/lib/exportMedia.js` — `media` бэка ↔ зоны, файл проекта, сводка покрытия; с тестами.
-- `src/lib/api.js` — загрузка ЖК и картинки.
-- `src/context/EditorContext.jsx` — состояние и история (reducer); `ViewContext.jsx` — зум/смещение.
-- `src/components/` — `CanvasStage` (холст), `Toolbar`, `ProjectBar` (источник и экспорт), `ZoneList`.
+If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.

@@ -1,309 +1,408 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { useEditor } from '../hooks/useEditor'
-import { useView } from '../hooks/useView'
-import {
-  HANDLES, MIN_SIZE, bboxOfPoints, clampPoint, distance, handlePosition, moveWithin, normalizeRect,
-  pointInPolygon, rectToPoints, resizeRect, snapToGrid, zoomAround,
-} from '../lib/geometry'
+import { useEditor } from "../context/EditorContext";
+import { useRef, useState, useCallback, useEffect, useMemo } from "react";
+import { Grid } from "lucide-react";
 
-const GRID = 10
-/** Размеры ручек и допуски — в ЭКРАННЫХ пикселях, делятся на зум, чтобы не расти с картинкой. */
-const HANDLE_PX = 10
-const HIT_PX = 8
-const CLOSE_PX = 12
-
-/**
- * Холст: картинка в НАТУРАЛЬНОМ размере внутри обёртки с transform (pan + zoom), поверх —
- * SVG того же размера. Координаты зон = пиксели картинки, никакого пересчёта под окно.
- *
- * Режимы: `select` — выделение, перенос, ручки прямоугольника и вершины полигона;
- * `rect` — протянуть прямоугольник; `polygon` — клики по вершинам, клик по первой /
- * Enter / двойной клик — замкнуть, Esc — отменить; `hand` — таскать холст (то же —
- * средняя кнопка или зажатый пробел). Колесо — зум вокруг курсора.
- */
 export default function CanvasStage() {
-  const { state, dispatch } = useEditor()
-  const { image, zones, selectedIds, mode, gridSnap } = state
-  const { view, setView, boxRef, fit } = useView()
-  const [draftRect, setDraftRect] = useState(null)
-  const [polyDraft, setPolyDraftState] = useState([])
-  // Черновик полигона дублируется в ref: решение «замкнуть или добавить точку» принимается
-  // снаружи setState. Внутри updater'а dispatch нельзя — StrictMode зовёт updater дважды,
-  // и полигон добавлялся два раза (ловилось вживую 23.09.26).
-  const polyRef = useRef([])
-  const setPolyDraft = useCallback((pts) => {
-    polyRef.current = pts
-    setPolyDraftState(pts)
-  }, [])
-  const [cursor, setCursor] = useState(null)
-  const [spaceHeld, setSpaceHeld] = useState(false)
-  const gesture = useRef(null)
-  const viewRef = useRef(view)
-  viewRef.current = view
-  const stateRef = useRef({ zones, selectedIds, mode, gridSnap, image })
-  stateRef.current = { zones, selectedIds, mode, gridSnap, image }
+  const { zones, addZone, image, mode, selectedIds, setSelectedIds, selectZone, updateZone, updateSelected, panOffset, setPanOffset, zoom, setZoom, gridSnap, setGridSnap, deleteSelected, undo, redo } = useEditor();
+  const canvasRef = useRef(null);
+  const wrapperRef = useRef(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
+  const [isResizing, setIsResizing] = useState(false);
+  const [resizeHandle, setResizeHandle] = useState(null);
+  const [isMultiSelecting, setIsMultiSelecting] = useState(false);
+  const [selectBox, setSelectBox] = useState(null);
+  const [startPos, setStartPos] = useState({ x: 0, y: 0 });
+  const [tempZone, setTempZone] = useState(null);
+  const [polyPoints, setPolyPoints] = useState([]);
+  const [isPanning, setIsPanning] = useState(false);
+  const [panStart, setPanStart] = useState({ x: 0, y: 0 });
+  const [lastTouchDist, setLastTouchDist] = useState(0);
+  const [dragThreshold, setDragThreshold] = useState(10); // px
 
-  // Новая картинка — вписать в кадр.
-  useEffect(() => {
-    fit(image)
-  }, [image, fit])
+  const snapToGrid = useCallback((pos) => gridSnap ? {
+    x: Math.round(pos.x / 20) * 20,
+    y: Math.round(pos.y / 20) * 20
+  } : pos, [gridSnap]);
 
-  const toImage = useCallback((e) => {
-    const box = boxRef.current
-    const v = viewRef.current
-    const r = box.getBoundingClientRect()
-    return { x: (e.clientX - r.left - v.pan.x) / v.zoom, y: (e.clientY - r.top - v.pan.y) / v.zoom }
-  }, [boxRef])
+  const getRelativePos = useCallback((e) => {
+    const rect = canvasRef.current.getBoundingClientRect();
+    const scaleX = e.clientX - rect.left;
+    const scaleY = e.clientY - rect.top;
+    return snapToGrid({
+      x: (scaleX - panOffset.x) / zoom,
+      y: (scaleY - panOffset.y) / zoom
+    });
+  }, [panOffset, zoom, snapToGrid]);
 
-  const snapped = useCallback((p) => {
-    const { gridSnap: g, image: img } = stateRef.current
-    const c = clampPoint(p, img.width, img.height)
-    return g ? { x: snapToGrid(c.x, GRID), y: snapToGrid(c.y, GRID) } : c
-  }, [])
+  // Intersection check for lasso
+  const intersects = useCallback((box, zone) => {
+    const boxRect = new DOMRect(box.x * zoom + panOffset.x, box.y * zoom + panOffset.y, box.width * zoom, box.height * zoom);
+    const zoneRect = new DOMRect(zone.x * zoom + panOffset.x, zone.y * zoom + panOffset.y, zone.width * zoom, zone.height * zoom);
+    return !(boxRect.right < zoneRect.left || zoneRect.right < boxRect.left ||
+             boxRect.bottom < zoneRect.top || zoneRect.bottom < boxRect.top);
+  }, [zoom, panOffset]);
 
-  /** Что под курсором в режиме выделения: ручка выделенной зоны, вершина полигона или тело зоны. */
-  const hitTest = useCallback((p) => {
-    const { zones: zs, selectedIds: sel } = stateRef.current
-    const tol = HIT_PX / viewRef.current.zoom
-    for (const id of sel) {
-      const z = zs.find((x) => x.id === id)
-      if (!z) continue
-      if (z.type === 'rect') {
-        const box = bboxOfPoints(z.points)
-        for (const h of HANDLES) {
-          if (distance(handlePosition(box, h), p) <= tol) return { kind: 'resize', zone: z, handle: h }
+  const getHandlePos = useCallback((handle, x, y, w, h) => {
+    const positions = {
+      n: { x: x + w / 2, y: y - 4 },
+      s: { x: x + w / 2, y: y + h },
+      e: { x: x + w, y: y + h / 2 },
+      w: { x: x - 4, y: y + h / 2 },
+      ne: { x: x + w, y: y - 4 },
+      nw: { x: x - 4, y: y - 4 },
+      se: { x: x + w, y: y + h },
+      sw: { x: x - 4, y: y + h }
+    };
+    return positions[handle];
+  }, []);
+
+  const throttle = useCallback((func, limit) => {
+    let inThrottle;
+    return (...args) => {
+      if (!inThrottle) {
+        func.apply(null, args);
+        inThrottle = true;
+        setTimeout(() => inThrottle = false, limit);
+      }
+    };
+  }, []);
+
+  const handlePointerDown = useCallback((e) => {
+    if (e.button !== 0) return;
+    e.currentTarget.setPointerCapture(e.pointerId); // Захват событий
+    const pos = getRelativePos(e);
+    const ctrlKey = e.ctrlKey;
+    const shiftKey = e.shiftKey;
+    setStartPos(pos);
+
+    if (mode === "hand") {
+      setIsPanning(true);
+      setPanStart({ x: e.clientX - panOffset.x, y: e.clientY - panOffset.y });
+      return;
+    }
+    if (mode === "select" && ctrlKey && shiftKey) {
+      setIsMultiSelecting(true);
+      setSelectBox({ x: pos.x, y: pos.y, width: 0, height: 0 });
+      return;
+    }
+    if (mode === "polygon") {
+      const first = polyPoints[0];
+      if (first && Math.abs(pos.x - first.x) < 10 && Math.abs(pos.y - first.y) < 10 && polyPoints.length > 2) {
+        const points = [...polyPoints, first];
+        const bbox = points.reduce((acc, p) => ({
+          minX: Math.min(acc.minX, p.x), minY: Math.min(acc.minY, p.y),
+          maxX: Math.max(acc.maxX, p.x), maxY: Math.max(acc.maxY, p.y)
+        }), { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity });
+        addZone(bbox.minX, bbox.minY, bbox.maxX - bbox.minX, bbox.maxY - bbox.minY, "polygon", { points });
+        setPolyPoints([]);
+        return;
+      }
+      setPolyPoints(prev => [...prev, pos]);
+      return;
+    }
+    if (mode === "text") {
+      addZone(pos.x, pos.y, 150, 50, "text", { content: "Текст..." });
+      return;
+    }
+    if (mode === "rect") {
+      setTempZone({ x: pos.x, y: pos.y, width: 0, height: 0 });
+      return;
+    }
+
+    // Выделение/Drag/Resize
+    let targetZone = null;
+    let handle = null;
+    zones.forEach((zone) => {
+      const adjX = zone.x * zoom + panOffset.x;
+      const adjY = zone.y * zoom + panOffset.y;
+      const adjW = zone.width * zoom;
+      const adjH = zone.height * zoom;
+      if (pos.x * zoom >= adjX && pos.x * zoom <= adjX + adjW && pos.y * zoom >= adjY && pos.y * zoom <= adjY + adjH) {
+        targetZone = zone;
+      }
+      const handleSize = 8 / zoom;
+      ['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw'].forEach(h => {
+        const hp = getHandlePos(h, adjX, adjY, adjW, adjH);
+        if (Math.hypot(pos.x * zoom - hp.x, pos.y * zoom - hp.y) < handleSize) {
+          handle = h;
+          targetZone = zone;
         }
+      });
+    });
+
+    if (targetZone) {
+      if (ctrlKey) {
+        selectZone(targetZone.id, true); // Toggle add/remove
       } else {
-        const i = z.points.findIndex((pt) => distance(pt, p) <= tol)
-        if (i >= 0) return { kind: 'vertex', zone: z, index: i }
+        setSelectedIds([targetZone.id]);
       }
-    }
-    for (let i = zs.length - 1; i >= 0; i--) {
-      if (pointInPolygon(p, zs[i].points)) return { kind: 'body', zone: zs[i] }
-    }
-    return null
-  }, [])
-
-  const closePolygon = useCallback(() => {
-    const pts = polyRef.current
-    if (pts.length >= 3) dispatch({ type: 'add', zone: { type: 'polygon', points: pts } })
-    setPolyDraft([])
-  }, [dispatch, setPolyDraft])
-
-  const onPointerDown = useCallback((e) => {
-    if (!stateRef.current.image) return
-    const box = boxRef.current
-    box.setPointerCapture(e.pointerId)
-    const { mode: m, selectedIds: sel } = stateRef.current
-    const wantPan = m === 'hand' || e.button === 1 || spaceHeld
-    if (wantPan) {
-      gesture.current = { kind: 'pan', startClient: { x: e.clientX, y: e.clientY }, startPan: viewRef.current.pan }
-      return
-    }
-    if (e.button !== 0) return
-    const p = snapped(toImage(e))
-    if (m === 'rect') {
-      gesture.current = { kind: 'rect', start: p }
-      setDraftRect({ x1: p.x, y1: p.y, x2: p.x, y2: p.y })
-      return
-    }
-    if (m === 'polygon') {
-      const pts = polyRef.current
-      if (pts.length >= 3 && distance(pts[0], p) <= CLOSE_PX / viewRef.current.zoom) closePolygon()
-      else setPolyDraft([...pts, p])
-      return
-    }
-    const hit = hitTest(p)
-    if (!hit) {
-      dispatch({ type: 'select', ids: [] })
-      return
-    }
-    if (hit.kind === 'body') {
-      const next = e.shiftKey
-        ? sel.includes(hit.zone.id) ? sel.filter((id) => id !== hit.zone.id) : [...sel, hit.zone.id]
-        : sel.includes(hit.zone.id) ? sel : [hit.zone.id]
-      dispatch({ type: 'select', ids: next })
-      gesture.current = { kind: 'move', last: p, ids: next, started: false }
-      return
-    }
-    if (hit.kind === 'resize') {
-      gesture.current = { kind: 'resize', id: hit.zone.id, handle: hit.handle, box: bboxOfPoints(hit.zone.points), start: p, started: false }
-      return
-    }
-    gesture.current = { kind: 'vertex', id: hit.zone.id, index: hit.index, started: false }
-  }, [boxRef, spaceHeld, snapped, toImage, hitTest, dispatch, closePolygon, setPolyDraft])
-
-  const onPointerMove = useCallback((e) => {
-    if (!stateRef.current.image) return
-    const g = gesture.current
-    const raw = toImage(e)
-    setCursor(raw)
-    if (!g) return
-    if (g.kind === 'pan') {
-      setView((v) => ({ ...v, pan: { x: g.startPan.x + e.clientX - g.startClient.x, y: g.startPan.y + e.clientY - g.startClient.y } }))
-      return
-    }
-    const p = snapped(raw)
-    if (g.kind === 'rect') {
-      setDraftRect({ x1: g.start.x, y1: g.start.y, x2: p.x, y2: p.y })
-      return
-    }
-    if (!g.started) {
-      dispatch({ type: 'beginGesture' })
-      g.started = true
-    }
-    const { image: img } = stateRef.current
-    if (g.kind === 'move') {
-      const dx = p.x - g.last.x, dy = p.y - g.last.y
-      g.last = p
-      const ids = new Set(g.ids)
-      dispatch({ type: 'patchLiveMany', patch: (z) => (ids.has(z.id) ? { points: moveWithin(z.points, dx, dy, img.width, img.height) } : null) })
-      return
-    }
-    if (g.kind === 'resize') {
-      const next = resizeRect(g.box, g.handle, p.x - g.start.x, p.y - g.start.y, img.width, img.height)
-      dispatch({ type: 'patchLive', id: g.id, props: { points: rectToPoints(next) } })
-      return
-    }
-    if (g.kind === 'vertex') {
-      const z = stateRef.current.zones.find((x) => x.id === g.id)
-      if (!z) return
-      const points = z.points.map((pt, i) => (i === g.index ? p : pt))
-      dispatch({ type: 'patchLive', id: g.id, props: { points } })
-    }
-  }, [toImage, snapped, setView, dispatch])
-
-  const onPointerUp = useCallback(() => {
-    const g = gesture.current
-    gesture.current = null
-    if (g?.kind === 'rect' && draftRect) {
-      const r = normalizeRect(draftRect.x1, draftRect.y1, draftRect.x2, draftRect.y2)
-      if (r.width >= MIN_SIZE && r.height >= MIN_SIZE) dispatch({ type: 'add', zone: { type: 'rect', points: rectToPoints(r) } })
-      setDraftRect(null)
-    }
-  }, [draftRect, dispatch])
-
-  const onDoubleClick = useCallback(() => {
-    if (stateRef.current.mode === 'polygon') closePolygon()
-  }, [closePolygon])
-
-  // Колесо — нативный слушатель: React вешает wheel пассивно, preventDefault там не работает.
-  useEffect(() => {
-    const box = boxRef.current
-    if (!box) return
-    const onWheel = (e) => {
-      e.preventDefault()
-      const r = box.getBoundingClientRect()
-      const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12
-      setView((v) => zoomAround(v, factor, { x: e.clientX - r.left, y: e.clientY - r.top }))
-    }
-    box.addEventListener('wheel', onWheel, { passive: false })
-    return () => box.removeEventListener('wheel', onWheel)
-  }, [boxRef, setView])
-
-  // Клавиатура: удаление, отмена, Enter для полигона, стрелки — сдвиг на 1 (Shift — 10) px картинки.
-  useEffect(() => {
-    const onKeyDown = (e) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLSelectElement) return
-      const { selectedIds: sel, zones: zs, image: img } = stateRef.current
-      if (e.code === 'Space') { setSpaceHeld(true); e.preventDefault(); return }
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); dispatch({ type: e.shiftKey ? 'redo' : 'undo' }); return }
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') { e.preventDefault(); dispatch({ type: 'redo' }); return }
-      if (e.key === 'Escape') { setPolyDraft([]); setDraftRect(null); dispatch({ type: 'select', ids: [] }); return }
-      if (e.key === 'Enter') { closePolygon(); return }
-      if ((e.key === 'Delete' || e.key === 'Backspace') && sel.length) { e.preventDefault(); dispatch({ type: 'delete', ids: sel }); return }
-      const step = e.shiftKey ? 10 : 1
-      const arrows = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] }
-      if (arrows[e.key] && sel.length && img) {
-        e.preventDefault()
-        const [dx, dy] = arrows[e.key]
-        const ids = new Set(sel)
-        dispatch({ type: 'updateMany', patch: (z) => (ids.has(z.id) ? { points: moveWithin(z.points, dx, dy, img.width, img.height) } : null) })
+      if (handle) {
+        setIsResizing(true);
+        setResizeHandle(handle);
+        setDragOffset({ x: pos.x * zoom - getHandlePos(handle, targetZone.x * zoom + panOffset.x, targetZone.y * zoom + panOffset.y, targetZone.width * zoom, targetZone.height * zoom).x, y: pos.y * zoom - getHandlePos(handle, targetZone.x * zoom + panOffset.x, targetZone.y * zoom + panOffset.y, targetZone.width * zoom, targetZone.height * zoom).y });
+      } else {
+        setIsDragging(true);
+        setDragOffset({ x: pos.x * zoom - (targetZone.x * zoom), y: pos.y * zoom - (targetZone.y * zoom) });
       }
-      void zs
+    } else if (mode === "select") {
+      if (!ctrlKey) setSelectedIds([]); // Deselect on empty unless Ctrl
     }
-    const onKeyUp = (e) => { if (e.code === 'Space') setSpaceHeld(false) }
-    window.addEventListener('keydown', onKeyDown)
-    window.addEventListener('keyup', onKeyUp)
-    return () => { window.removeEventListener('keydown', onKeyDown); window.removeEventListener('keyup', onKeyUp) }
-  }, [dispatch, closePolygon, setPolyDraft])
+  }, [mode, zones, getRelativePos, addZone, selectZone, setSelectedIds, panOffset, zoom, polyPoints, getHandlePos]);
 
-  const cursorStyle = gesture.current?.kind === 'pan' ? 'grabbing' : mode === 'hand' || spaceHeld ? 'grab' : mode === 'select' ? 'default' : 'crosshair'
-  const { zoom, pan } = view
-  const handleSize = HANDLE_PX / zoom
-  const stroke = (selected) => (selected ? 2.5 : 1.5) / zoom
-  const toPoints = (pts) => pts.map((p) => `${p.x},${p.y}`).join(' ')
-  const draft = draftRect ? normalizeRect(draftRect.x1, draftRect.y1, draftRect.x2, draftRect.y2) : null
+  const handlePointerMove = useCallback(throttle((e) => {
+    const pos = getRelativePos(e);
+    const shiftKey = e.shiftKey;
+    const dragDist = Math.hypot(pos.x - startPos.x, pos.y - startPos.y) * zoom;
+
+    if (isMultiSelecting && selectBox) {
+      setSelectBox({
+        x: Math.min(startPos.x, pos.x),
+        y: Math.min(startPos.y, pos.y),
+        width: Math.abs(pos.x - startPos.x),
+        height: Math.abs(pos.y - startPos.y)
+      });
+      return;
+    }
+    if (mode === "rect" && tempZone && dragDist > dragThreshold) {
+      const newX = Math.min(startPos.x, pos.x);
+      const newY = Math.min(startPos.y, pos.y);
+      setTempZone({
+        x: newX, y: newY,
+        width: Math.abs(pos.x - startPos.x),
+        height: Math.abs(pos.y - startPos.y)
+      });
+      return;
+    }
+    if (isDragging && dragDist > dragThreshold) {
+      const deltaX = (e.clientX - dragOffset.x - panOffset.x) / zoom;
+      const deltaY = (e.clientY - dragOffset.y - panOffset.y) / zoom;
+      updateSelected({ x: deltaX, y: deltaY }); // Применить delta ко всем selected
+      return;
+    }
+    if (isResizing && selectedIds.length === 1 && dragDist > dragThreshold) {
+      const zone = zones.find(z => z.id === selectedIds[0]);
+      let newW = zone.width, newH = zone.height, newX = zone.x, newY = zone.y;
+      const aspect = shiftKey ? zone.width / zone.height : 1;
+      // Пример для 'se' — аналогично для других
+      if (resizeHandle === 'se') {
+        newW = Math.max(20 / zoom, (e.clientX - zone.x * zoom - panOffset.x) / zoom);
+        newH = shiftKey ? newW * aspect : Math.max(20 / zoom, (e.clientY - zone.y * zoom - panOffset.y) / zoom);
+      } // Добавить cases для других handles
+      updateZone(selectedIds[0], { x: newX, y: newY, width: newW, height: newH });
+      return;
+    }
+    if (isPanning) {
+      setPanOffset({
+        x: e.clientX - panStart.x,
+        y: e.clientY - panStart.y
+      });
+    }
+  }, 16), [mode, tempZone, startPos, isDragging, selectedIds, zones, dragOffset, updateSelected, isResizing, resizeHandle, getRelativePos, isPanning, panStart, zoom, panOffset, isMultiSelecting, selectBox, dragThreshold]);
+
+  const handlePointerUp = useCallback((e) => {
+    const pos = getRelativePos(e);
+    const dragDist = Math.hypot(pos.x - startPos.x, pos.y - startPos.y) * zoom;
+
+    if (mode === "rect" && tempZone && dragDist > dragThreshold) {
+      addZone(tempZone.x, tempZone.y, tempZone.width, tempZone.height);
+    }
+    if (isMultiSelecting) {
+      // Lasso: add intersecting zones
+      const newSelected = [...selectedIds];
+      zones.forEach((zone) => {
+        if (intersects(selectBox, zone) && !newSelected.includes(zone.id)) {
+          newSelected.push(zone.id);
+        }
+      });
+      setSelectedIds(newSelected);
+      setSelectBox(null);
+      setIsMultiSelecting(false);
+    }
+    if (dragDist <= dragThreshold && mode === "select") {
+      setSelectedIds([]); // Deselect if no drag
+    }
+    setTempZone(null);
+    setIsDragging(false);
+    setIsResizing(false);
+    setIsPanning(false);
+  }, [mode, tempZone, addZone, getRelativePos, isMultiSelecting, selectBox, selectedIds, setSelectedIds, zones, intersects, dragThreshold]);
+
+  const handleClick = useCallback((e) => {
+    if (mode === "select" && e.detail === 1) { // Single click
+      const pos = getRelativePos(e);
+      addZone(pos.x, pos.y);
+    }
+  }, [mode, getRelativePos, addZone]);
+
+  const handlePointerLeave = useCallback((e) => {
+    handlePointerUp(e); // Cancel on leave
+  }, [handlePointerUp]);
+
+  const handleWheel = useCallback((e) => {
+    e.preventDefault();
+    const delta = e.deltaY > 0 ? 0.9 : 1.1;
+    const newZoom = Math.min(10, Math.max(0.1, zoom * delta));
+    setZoom(newZoom);
+    const rect = canvasRef.current.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
+    const mouseY = e.clientY - rect.top;
+    setPanOffset({
+      x: mouseX - (mouseX - panOffset.x) * (newZoom / zoom),
+      y: mouseY - (mouseY - panOffset.y) * (newZoom / zoom)
+    });
+  }, [zoom, panOffset]);
+
+  const handleTouchStart = useCallback((e) => {
+    if (e.touches.length === 2) {
+      const dist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
+      setLastTouchDist(dist);
+    }
+  }, []);
+
+  const handleTouchMove = useCallback((e) => {
+    if (e.touches.length === 2) {
+      const dist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
+      const delta = dist / lastTouchDist;
+      setZoom(Math.min(10, Math.max(0.1, zoom * delta)));
+      setLastTouchDist(dist);
+      e.preventDefault();
+    }
+  }, [lastTouchDist, zoom]);
+
+  useEffect(() => {
+    const onKey = (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'z') { e.preventDefault(); undo(); }
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'Z') { e.preventDefault(); redo(); }
+      if (e.key === 'Escape') setSelectedIds([]);
+      if (e.key === 'Delete') deleteSelected();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [undo, redo, deleteSelected, setSelectedIds]);
+
+  const cursorClass = isPanning ? "cursor-grabbing" : 
+                     isResizing ? `cursor-${resizeHandle}-resize` : 
+                     mode === "hand" ? "cursor-grab" : 
+                     isMultiSelecting ? "cursor-crosshair" : "cursor-default";
+
+  const renderedZones = useMemo(() => zones.map((z) => {
+    const isSelected = selectedIds.includes(z.id);
+    const adjX = z.x * zoom + panOffset.x;
+    const adjY = z.y * zoom + panOffset.y;
+    const adjW = z.width * zoom;
+    const adjH = z.height * zoom;
+    return { z, isSelected, adjX, adjY, adjW, adjH };
+  }), [zones, selectedIds, zoom, panOffset]);
 
   return (
     <div
-      ref={boxRef}
-      className="relative h-full w-full select-none overflow-hidden rounded-xl bg-[#E8EEF4]"
-      style={{ cursor: cursorStyle, touchAction: 'none' }}
-      onPointerDown={onPointerDown}
-      onPointerMove={onPointerMove}
-      onPointerUp={onPointerUp}
-      onPointerCancel={onPointerUp}
-      onDoubleClick={onDoubleClick}
-      onContextMenu={(e) => e.preventDefault()}
+      ref={canvasRef}
+      className={`w-full h-full bg-gray-200 rounded-xl relative select-none ${cursorClass}`} // user-select: none
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
+      onPointerLeave={handlePointerLeave}
+      onClick={handleClick}
+      onWheel={handleWheel}
+      onTouchStart={handleTouchStart}
+      onTouchMove={handleTouchMove}
+      style={{ overflow: 'hidden', touchAction: 'none' }}
     >
-      {image ? (
-        <div
-          style={{ position: 'absolute', left: 0, top: 0, width: image.width, height: image.height, transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, transformOrigin: '0 0' }}
-        >
-          <img src={image.src} width={image.width} height={image.height} alt="" draggable={false} style={{ display: 'block', pointerEvents: 'none', userSelect: 'none', maxWidth: 'none' }} />
-          <svg width={image.width} height={image.height} viewBox={`0 0 ${image.width} ${image.height}`} style={{ position: 'absolute', left: 0, top: 0, overflow: 'visible' }}>
-            {zones.map((z) => {
-              const selected = selectedIds.includes(z.id)
-              const box = bboxOfPoints(z.points)
-              return (
-                <g key={z.id}>
-                  <polygon points={toPoints(z.points)} fill={z.color} fillOpacity={selected ? 0.3 : 0.18} stroke={z.color} strokeWidth={stroke(selected)} strokeLinejoin="round" />
-                  <text x={box.x + 6 / zoom} y={box.y + 18 / zoom} fontSize={13 / zoom} fontFamily="Manrope, system-ui, sans-serif" fontWeight="700" fill="#fff" stroke="#142246" strokeWidth={3 / zoom} paintOrder="stroke" style={{ pointerEvents: 'none' }}>
-                    {z.name}
-                  </text>
-                  {selected && z.type === 'rect' && HANDLES.map((h) => {
-                    const hp = handlePosition(box, h)
-                    return <rect key={h} x={hp.x - handleSize / 2} y={hp.y - handleSize / 2} width={handleSize} height={handleSize} fill="#fff" stroke="#3960C7" strokeWidth={1.5 / zoom} />
-                  })}
-                  {selected && z.type === 'polygon' && z.points.map((pt, i) => (
-                    <circle key={i} cx={pt.x} cy={pt.y} r={handleSize / 2} fill="#fff" stroke="#3960C7" strokeWidth={1.5 / zoom} />
-                  ))}
-                </g>
-              )
-            })}
-            {draft && (
-              <rect x={draft.x} y={draft.y} width={draft.width} height={draft.height} fill="#3960C7" fillOpacity={0.15} stroke="#3960C7" strokeWidth={1.5 / zoom} strokeDasharray={`${6 / zoom} ${4 / zoom}`} />
+      <div
+        ref={wrapperRef}
+        className="absolute inset-0"
+        style={{
+          transform: `translate(${panOffset.x}px, ${panOffset.y}px) scale(${zoom})`,
+          transformOrigin: '0 0'
+        }}
+      >
+        {image && <img src={image} alt="Background" className="absolute top-0 left-0 w-full h-full object-contain pointer-events-none" />}
+        {renderedZones.map(({ z, isSelected, adjX, adjY, adjW, adjH }) => (
+          <div
+            key={z.id}
+            className={`absolute border-2 ${isSelected ? 'border-blue-500 shadow-lg' : 'border-gray-500'} ${z.type === 'text' ? 'bg-white/90' : 'bg-blue-200/30'} rounded overflow-hidden cursor-move`}
+            style={{ left: adjX, top: adjY, width: adjW, height: adjH }}
+          >
+            {z.type === "rect" && <div className="w-full h-full" />}
+            {z.type === "polygon" && (
+              <svg className="w-full h-full" viewBox={`0 0 ${z.width} ${z.height}`}>
+                <polygon
+                  points={z.points.map(p => `${p.x - z.x},${p.y - z.y}`).join(' ')}
+                  fill={z.color + '20'}
+                  stroke={z.color}
+                  strokeWidth="2"
+                />
+              </svg>
             )}
-            {polyDraft.length > 0 && (
-              <g>
-                <polyline points={toPoints(cursor ? [...polyDraft, cursor] : polyDraft)} fill="none" stroke="#3960C7" strokeWidth={1.5 / zoom} strokeDasharray={`${6 / zoom} ${4 / zoom}`} />
-                {polyDraft.map((pt, i) => (
-                  <circle key={i} cx={pt.x} cy={pt.y} r={(i === 0 ? CLOSE_PX / 2 : 4) / zoom} fill={i === 0 ? '#fff' : '#3960C7'} stroke="#3960C7" strokeWidth={1.5 / zoom} />
+            {z.type === "text" && (
+              <div
+                contentEditable
+                suppressContentEditableWarning
+                className={`w-full h-full outline-none p-1 text-sm resize-none overflow-auto ${z.style?.bold ? 'font-bold' : ''} ${z.style?.italic ? 'italic' : ''}`}
+                onInput={(e) => updateZone(z.id, { content: e.currentTarget.innerText })}
+                style={{ minHeight: '100%' }}
+              >
+                {z.content || "Текст..."}
+              </div>
+            )}
+            {isSelected && (
+              <>
+                <span className="absolute -top-1 -left-1 text-xs bg-blue-500 text-white px-1 rounded">{z.name}</span>
+                {['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw'].map(h => (
+                  <div
+                    key={h}
+                    className={`absolute bg-blue-500 w-3 h-3 rounded-full cursor-${h}-resize`}
+                    style={getHandlePos(h, adjX, adjY, adjW, adjH)}
+                  />
                 ))}
-              </g>
+              </>
             )}
+          </div>
+        ))}
+        {tempZone && (
+          <div
+            className="absolute border-2 border-dashed border-blue-500 bg-blue-200/20 pointer-events-none"
+            style={{ left: tempZone.x * zoom + panOffset.x, top: tempZone.y * zoom + panOffset.y, width: tempZone.width * zoom, height: tempZone.height * zoom }}
+          />
+        )}
+        {mode === "polygon" && polyPoints.length > 0 && (
+          <svg className="absolute inset-0 pointer-events-none" style={{ left: 0, top: 0, width: '100%', height: '100%' }}>
+            <polyline
+              points={polyPoints.map(p => `${p.x * zoom},${p.y * zoom}`).join(' ')}
+              stroke="#3b82f6"
+              strokeWidth="2"
+              fill="none"
+              strokeDasharray="5,5"
+            />
+            {polyPoints.map((p, i) => (
+              <circle key={i} cx={p.x * zoom} cy={p.y * zoom} r="3" fill="#3b82f6" />
+            ))}
           </svg>
-        </div>
-      ) : (
-        <div className="absolute inset-0 flex items-center justify-center p-8 text-center text-sm text-gray-500">
-          Загрузите ЖК по slug или картинку генплана с диска — и обводите корпуса.
+        )}
+      </div>
+      {selectBox && (
+        <div
+          className="absolute border-2 border-dashed border-blue-500 bg-blue-200/20 pointer-events-none"
+          style={{ left: selectBox.x * zoom + panOffset.x, top: selectBox.y * zoom + panOffset.y, width: selectBox.width * zoom, height: selectBox.height * zoom }}
+        />
+      )}
+      {selectedIds.length > 0 && (
+        <div className="absolute top-2 left-1/2 -translate-x-1/2 bg-blue-500 text-white px-3 py-1 rounded text-sm">
+          Выбрано: {selectedIds.length}
         </div>
       )}
-
-      {image && (
-        <div className="pointer-events-none absolute bottom-2 left-2 rounded bg-white/90 px-2 py-1 font-mono text-[11px] text-gray-700 shadow">
-          {Math.round(zoom * 100)}% · {image.width}×{image.height}px
-          {cursor && cursor.x >= 0 && cursor.y >= 0 && cursor.x <= image.width && cursor.y <= image.height && (
-            <> · x {Math.round(cursor.x)} y {Math.round(cursor.y)} · {((cursor.x / image.width) * 100).toFixed(2)}% {((cursor.y / image.height) * 100).toFixed(2)}%</>
-          )}
-        </div>
+      {polyPoints.length > 0 && <div className="absolute top-2 right-2 bg-blue-500 text-white px-2 py-1 rounded text-sm">Точек: {polyPoints.length} (клик на первую для закрытия)</div>}
+      {!image && zones.length === 0 && (
+        <span className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-gray-500 text-center">
+          Загрузи изображение и используй инструменты!
+        </span>
       )}
-      {polyDraft.length > 0 && (
-        <div className="pointer-events-none absolute right-2 top-2 rounded bg-[#3960C7] px-2 py-1 text-xs text-white shadow">
-          Точек: {polyDraft.length} · клик по первой, Enter или двойной клик — замкнуть · Esc — отмена
-        </div>
-      )}
+      <div className="absolute bottom-2 left-2 text-xs text-gray-500">Zoom: {zoom.toFixed(2)}x | Esc: Deselect | Del: Delete</div>
+      <button onClick={() => setGridSnap(!gridSnap)} className="absolute top-2 right-2 p-1 bg-white rounded shadow text-xs">
+        <Grid size={12} />
+        {gridSnap ? 'On' : 'Off'}
+      </button>
     </div>
-  )
+  );
 }
