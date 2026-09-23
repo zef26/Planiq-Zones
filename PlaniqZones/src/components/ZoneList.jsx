@@ -1,132 +1,104 @@
-import { useState } from "react";
-import { Trash2, Edit3, MapPin, Save, Square, Triangle, Type, Palette } from "lucide-react";
-import { useEditor } from "../context/EditorContext";
+import { Pentagon, Square, Trash2 } from 'lucide-react'
+import { useEditor } from '../hooks/useEditor'
+import { coverage } from '../lib/exportMedia'
+import { bboxOfPoints, toPercent } from '../lib/geometry'
 
-function Tooltip({ text, children }) {
-  return (
-    <div className="relative group">
-      {children}
-      <span className="absolute bottom-full mb-1 left-1/2 -translate-x-1/2 px-2 py-1 text-xs text-white bg-gray-800 rounded opacity-0 group-hover:opacity-100 transition whitespace-nowrap">
-        {text}
-      </span>
-    </div>
-  );
-}
+const ICON = { rect: Square, polygon: Pentagon }
 
-const typeIcons = { rect: Square, polygon: Triangle, text: Type };
-
+/**
+ * Список зон: имя, тип, привязка к корпусу, удаление. Ниже — сводка «кто без корпуса, какой
+ * корпус без зоны»: без неё экспорт молча теряет зоны. У выделенной зоны — её координаты
+ * в пикселях и процентах: чтобы сверить глазами, что уходит бэку.
+ */
 export default function ZoneList() {
-  const { zones, selectedIds, selectZone, updateZone, deleteZone, updateSelected } = useEditor();
-  const [editingId, setEditingId] = useState(null);
-  const [editName, setEditName] = useState("");
-  const [colorInput, setColorInput] = useState("#60a5fa");
-
-  const handleSelect = (zone) => {
-    selectZone(zone.id, e.ctrlKey);
-    setEditingId(null);
-    setColorInput(zone.color || "#60a5fa");
-  };
-
-  const startEdit = (zone) => {
-    setEditingId(zone.id);
-    setEditName(zone.name || "");
-  };
-
-  const saveEdit = () => {
-    if (editingId) updateZone(editingId, { name: editName });
-    setEditingId(null);
-  };
-
-  const changeColor = (e) => {
-    setColorInput(e.target.value);
-    if (selectedIds.length === 1) updateZone(selectedIds[0], { color: e.target.value });
-    else updateSelected({ color: e.target.value });
-  };
+  const { state, dispatch } = useEditor()
+  const { zones, blocks, selectedIds, image } = state
+  const { unboundZones, blocksWithoutZone } = coverage(zones, blocks)
+  const selected = selectedIds.length === 1 ? zones.find((z) => z.id === selectedIds[0]) : null
 
   return (
-    <div className="bg-white rounded-2xl shadow-md p-4 w-full">
-      <h2 className="text-lg font-semibold mb-3 flex items-center gap-2">
-        <MapPin size={20} className="text-gray-400" />
-        Список зон ({zones.length})
-      </h2>
-      {selectedIds.length > 1 && (
-        <div className="mb-2 p-2 bg-blue-50 rounded flex gap-2 items-center">
-          <span className="text-sm text-blue-700">Выбрано: {selectedIds.length}</span>
-          <Tooltip text="Цвет для всех">
-            <input type="color" value={colorInput} onChange={changeColor} className="w-8 h-8 rounded cursor-pointer" />
-          </Tooltip>
+    <div className="flex flex-col gap-3">
+      <h2 className="text-sm font-bold text-gray-800">Зоны ({zones.length})</h2>
+
+      {zones.length === 0 && <p className="text-xs text-gray-500">Обведите корпуса прямоугольником или полигоном — они появятся здесь.</p>}
+
+      <ul className="flex flex-col gap-1">
+        {zones.map((zone) => {
+          const isSelected = selectedIds.includes(zone.id)
+          const Icon = ICON[zone.type] ?? Square
+          return (
+            <li
+              key={zone.id}
+              onClick={(e) => dispatch({ type: 'select', ids: e.shiftKey ? (isSelected ? selectedIds.filter((id) => id !== zone.id) : [...selectedIds, zone.id]) : [zone.id] })}
+              className={`flex cursor-pointer flex-col gap-1 rounded-lg border p-2 transition-colors ${isSelected ? 'border-[#3960C7] bg-[#EBEFF9]' : 'border-transparent bg-gray-50 hover:bg-gray-100'}`}
+            >
+              <div className="flex items-center gap-2">
+                <Icon size={14} className={isSelected ? 'text-[#3960C7]' : 'text-gray-400'} />
+                <input
+                  value={zone.name}
+                  onChange={(e) => dispatch({ type: 'update', id: zone.id, props: { name: e.target.value } })}
+                  onClick={(e) => e.stopPropagation()}
+                  className="min-w-0 flex-1 rounded border border-transparent bg-transparent px-1 text-sm font-medium text-gray-800 focus:border-[#C2CEEE] focus:bg-white focus:outline-none"
+                  aria-label="Имя зоны"
+                />
+                <input
+                  type="color"
+                  value={zone.color}
+                  onChange={(e) => dispatch({ type: 'update', id: zone.id, props: { color: e.target.value } })}
+                  onClick={(e) => e.stopPropagation()}
+                  className="h-6 w-6 cursor-pointer rounded border-0 bg-transparent p-0"
+                  aria-label="Цвет зоны"
+                  title="Цвет"
+                />
+                <button type="button" title="Удалить" onClick={(e) => { e.stopPropagation(); dispatch({ type: 'delete', ids: [zone.id] }) }} className="rounded p-1 text-red-500 hover:bg-red-50">
+                  <Trash2 size={14} />
+                </button>
+              </div>
+              {blocks.length > 0 ? (
+                <select
+                  value={zone.blockId ?? ''}
+                  onChange={(e) => dispatch({ type: 'update', id: zone.id, props: { blockId: e.target.value || null, ...(e.target.value && zone.name.startsWith('Зона ') ? { name: blocks.find((b) => b.id === e.target.value)?.name ?? zone.name } : {}) } })}
+                  onClick={(e) => e.stopPropagation()}
+                  className={`w-full rounded border px-2 py-1 text-xs ${zone.blockId ? 'border-[#C2CEEE] bg-white text-gray-800' : 'border-amber-300 bg-amber-50 text-amber-800'}`}
+                  aria-label="Корпус"
+                >
+                  <option value="">— корпус не выбран —</option>
+                  {blocks.map((b) => (
+                    <option key={b.id} value={b.id}>{b.name}{b.floors ? ` · ${b.floors} эт.` : ''}</option>
+                  ))}
+                </select>
+              ) : (
+                <input
+                  value={zone.blockId ?? ''}
+                  onChange={(e) => dispatch({ type: 'update', id: zone.id, props: { blockId: e.target.value.trim() || null } })}
+                  onClick={(e) => e.stopPropagation()}
+                  placeholder="id корпуса (uuid) — картинка без ЖК"
+                  className={`w-full rounded border px-2 py-1 font-mono text-xs ${zone.blockId ? 'border-[#C2CEEE] bg-white' : 'border-amber-300 bg-amber-50'}`}
+                  aria-label="Id корпуса"
+                />
+              )}
+            </li>
+          )
+        })}
+      </ul>
+
+      {(unboundZones.length > 0 || blocksWithoutZone.length > 0) && zones.length + blocks.length > 0 && (
+        <div className="rounded-lg border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900">
+          {unboundZones.length > 0 && <p>Без корпуса: {unboundZones.map((z) => z.name).join(', ')} — в экспорт не попадут.</p>}
+          {blocksWithoutZone.length > 0 && <p>Корпуса без зоны: {blocksWithoutZone.map((b) => b.name).join(', ')}.</p>}
         </div>
       )}
-      <div className="space-y-2 max-h-96 overflow-y-auto">
-        {zones.map((zone) => {
-          const isSelected = selectedIds.includes(zone.id);
-          const Icon = typeIcons[zone.type] || MapPin;
-          return (
-            <div
-              key={zone.id}
-              onClick={(e) => handleSelect(zone, e)}
-              className={`flex items-center justify-between p-3 rounded-xl cursor-pointer transition
-                ${isSelected ? "bg-blue-100 border-2 border-blue-400" : "bg-gray-50 hover:bg-gray-100"}`}
-            >
-              <div className="flex items-center gap-2 flex-1">
-                <input
-                  type="checkbox"
-                  checked={isSelected}
-                  onChange={() => selectZone(zone.id, true)}
-                  onClick={(e) => e.stopPropagation()}
-                  className="w-4 h-4"
-                />
-                <Icon size={16} className={isSelected ? "text-blue-600" : "text-gray-400"} />
-                {editingId === zone.id ? (
-                  <input
-                    value={editName}
-                    onChange={(e) => setEditName(e.target.value)}
-                    onClick={(e) => e.stopPropagation()}
-                    className="flex-1 px-2 py-1 border rounded text-sm bg-white"
-                    autoFocus
-                  />
-                ) : (
-                  <span className={`font-medium truncate ${isSelected ? "text-blue-700" : "text-gray-700"}`}>
-                    {zone.name || `Зона ${zone.id.toString().slice(-4)}`}
-                  </span>
-                )}
-                <span className="text-xs text-gray-400">({zone.type})</span>
-              </div>
-              <div className="flex items-center gap-1">
-                {isSelected && (
-                  <Tooltip text="Цвет">
-                    <input
-                      type="color"
-                      value={colorInput}
-                      onChange={changeColor}
-                      className="w-6 h-6 rounded cursor-pointer"
-                    />
-                  </Tooltip>
-                )}
-                {editingId === zone.id ? (
-                  <Tooltip text="Сохранить">
-                    <button onClick={saveEdit} className="p-1 hover:bg-green-200 rounded">
-                      <Save size={14} className="text-green-600" />
-                    </button>
-                  </Tooltip>
-                ) : (
-                  <Tooltip text="Редактировать">
-                    <button onClick={(e) => { e.stopPropagation(); startEdit(zone); }} className="p-1 hover:bg-gray-200 rounded">
-                      <Edit3 size={14} className="text-gray-600" />
-                    </button>
-                  </Tooltip>
-                )}
-                <Tooltip text="Удалить">
-                  <button onClick={(e) => { e.stopPropagation(); deleteZone(zone.id); }} className="p-1 hover:bg-red-100 rounded">
-                    <Trash2 size={14} className="text-red-500" />
-                  </button>
-                </Tooltip>
-              </div>
-            </div>
-          );
-        })}
-      </div>
-      {zones.length === 0 && <p className="text-gray-500 text-sm mt-4 italic text-center">Добавь зоны!</p>}
+      {zones.length > 0 && unboundZones.length === 0 && blocksWithoutZone.length === 0 && blocks.length > 0 && (
+        <p className="rounded-lg border border-emerald-200 bg-emerald-50 p-2 text-xs text-emerald-900">Все корпуса обведены — можно экспортировать.</p>
+      )}
+
+      {selected && image && (
+        <div className="rounded-lg bg-gray-50 p-2 font-mono text-[11px] text-gray-600">
+          <div className="mb-1 font-sans text-xs font-bold text-gray-800">{selected.name} · {selected.type === 'rect' ? 'прямоугольник' : `полигон, ${selected.points.length} т.`}</div>
+          {(() => { const b = bboxOfPoints(selected.points); return <div>bbox px: {Math.round(b.x)}, {Math.round(b.y)} · {Math.round(b.width)}×{Math.round(b.height)}</div> })()}
+          <div className="mt-1 break-all">coords %: {JSON.stringify(toPercent(selected.points, image.width, image.height))}</div>
+        </div>
+      )}
     </div>
-  );
+  )
 }

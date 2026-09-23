@@ -1,145 +1,65 @@
-import { useRef } from "react";
-import { MousePointer, Square, Triangle, Type, Hand, Upload, FileDown, FileUp, Trash2, Undo, Redo, ZoomIn, ZoomOut, Grid } from "lucide-react";
-import { useEditor } from "../context/EditorContext";
+import { Grid3x3, Hand, Maximize2, MousePointer2, Pentagon, Redo2, Square, Trash2, Undo2, ZoomIn, ZoomOut } from 'lucide-react'
+import { useEditor } from '../hooks/useEditor'
+import { useView } from '../hooks/useView'
 
-const tools = [
-  { id: "select", title: "Выделение", Icon: MousePointer },
-  { id: "rect", title: "Прямоугольник", Icon: Square },
-  { id: "polygon", title: "Полигон", Icon: Triangle },
-  { id: "text", title: "Текст", Icon: Type },
-  { id: "hand", title: "Рука", Icon: Hand },
-];
+const TOOLS = [
+  { id: 'select', title: 'Выделение (V)', Icon: MousePointer2 },
+  { id: 'rect', title: 'Прямоугольник (R)', Icon: Square },
+  { id: 'polygon', title: 'Полигон (P)', Icon: Pentagon },
+  { id: 'hand', title: 'Рука (H, пробел)', Icon: Hand },
+]
 
+const btn = (active = false, disabled = false) =>
+  `flex h-9 items-center justify-center gap-1 rounded-lg px-2 text-sm transition-colors ${
+    active ? 'bg-[#3960C7] text-white' : 'text-gray-700 hover:bg-[#EBEFF9] hover:text-[#3960C7]'
+  } ${disabled ? 'cursor-not-allowed opacity-40 hover:bg-transparent hover:text-gray-700' : 'cursor-pointer'}`
+
+/** Инструменты рисования, зум и история. Файлы и загрузка ЖК — в `ProjectBar`. */
 export default function Toolbar() {
-  const { mode, setMode, setZones, zones, image, setImage, zoom, setZoom, undo, redo, historyPosRef, gridSnap, setGridSnap, exportPNG, exportSVG, updateSelected } = useEditor();
-  const uploadRef = useRef(null);
-  const importRef = useRef(null);
-
-  const handleFileToBase64 = (file, callback) => {
-    const reader = new FileReader();
-    reader.onloadend = () => callback(reader.result);
-    reader.readAsDataURL(file);
-  };
-
-  const handleUploadImage = (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    handleFileToBase64(file, setImage);
-  };
-
-  const handleZoomIn = () => setZoom(Math.min(10, zoom * 1.2));
-  const handleZoomOut = () => setZoom(Math.max(0.1, zoom / 1.2));
-  const handleResetZoom = () => { setZoom(1); setPanOffset({ x: 0, y: 0 }); };
-
-  const handleExport = () => {
-    const data = { zones, image };
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "annotation.json";
-    a.click();
-    URL.revokeObjectURL(url);
-  };
-
-  const handleImport = (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      try {
-        const data = JSON.parse(e.target.result);
-        if (data?.zones) setZones(data.zones);
-        if (data?.image) setImage(data.image);
-      } catch (err) {
-        alert("Ошибка: " + err.message);
-      }
-    };
-    reader.readAsText(file);
-  };
+  const { state, dispatch, canUndo, canRedo } = useEditor()
+  const { view, zoomBy, zoomTo, fit } = useView()
+  const hasImage = !!state.image
+  const hasSelection = state.selectedIds.length > 0
 
   return (
-    <div className="flex items-center justify-between gap-4">
-      {/* Tools */}
-      <div className="flex items-center gap-2">
-        {tools.map(({ id, title, Icon }) => (
-          <button
-            key={id}
-            onClick={() => setMode(id)}
-            className={`p-2 rounded-xl flex items-center justify-center transition-all shadow-sm
-              ${mode === id ? "bg-blue-600 text-white scale-105 shadow-md" : "text-gray-600 hover:text-blue-600 hover:bg-blue-50"}`}
-            title={title}
-          >
-            <Icon size={18} />
-          </button>
-        ))}
-        <span className="text-sm text-gray-600">{tools.find(t => t.id === mode)?.title}</span>
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+      <div className="flex items-center gap-1" role="toolbar" aria-label="Инструменты">
+        {TOOLS.map((tool) => {
+          const Icon = tool.Icon
+          return (
+            <button key={tool.id} type="button" title={tool.title} aria-pressed={state.mode === tool.id} onClick={() => dispatch({ type: 'setMode', mode: tool.id })} className={btn(state.mode === tool.id)}>
+              <Icon size={18} />
+            </button>
+          )
+        })}
+        <span className="ml-1 text-xs text-gray-500">{TOOLS.find((t) => t.id === state.mode)?.title}</span>
       </div>
 
-      {/* Zoom */}
-      <div className="flex items-center gap-2">
-        <button onClick={handleZoomOut} className="p-2 rounded-xl text-gray-600 hover:bg-gray-100" title="Zoom Out">
-          <ZoomOut size={18} />
-        </button>
-        <span className="text-sm text-gray-600 w-12 text-center">{zoom.toFixed(1)}x</span>
-        <button onClick={handleZoomIn} className="p-2 rounded-xl text-gray-600 hover:bg-gray-100" title="Zoom In">
-          <ZoomIn size={18} />
-        </button>
-        <button onClick={handleResetZoom} className="p-2 rounded-xl text-gray-600 hover:bg-gray-100" title="Reset">1x</button>
+      <div className="h-6 w-px bg-gray-200" />
+
+      <div className="flex items-center gap-1" aria-label="Масштаб">
+        <button type="button" title="Отдалить" onClick={() => zoomBy(1 / 1.25)} disabled={!hasImage} className={btn(false, !hasImage)}><ZoomOut size={18} /></button>
+        <button type="button" title="100 %" onClick={() => zoomTo(1)} disabled={!hasImage} className={`${btn(false, !hasImage)} w-14 font-mono text-xs`}>{Math.round(view.zoom * 100)}%</button>
+        <button type="button" title="Приблизить" onClick={() => zoomBy(1.25)} disabled={!hasImage} className={btn(false, !hasImage)}><ZoomIn size={18} /></button>
+        <button type="button" title="Вписать в кадр" onClick={() => fit(state.image)} disabled={!hasImage} className={btn(false, !hasImage)}><Maximize2 size={18} /></button>
       </div>
 
-      {/* History */}
-      <div className="flex items-center gap-2">
-        <button onClick={undo} disabled={historyPosRef.current === 0} className="p-2 rounded-xl text-gray-600 hover:bg-gray-100 disabled:opacity-50" title="Undo">
-          <Undo size={18} />
-        </button>
-        <button onClick={redo} disabled={historyPosRef.current === historyPosRef.max} className="p-2 rounded-xl text-gray-600 hover:bg-gray-100 disabled:opacity-50" title="Redo">
-          <Redo size={18} />
-        </button>
+      <div className="h-6 w-px bg-gray-200" />
+
+      <div className="flex items-center gap-1" aria-label="История">
+        <button type="button" title="Отменить (Ctrl+Z)" onClick={() => dispatch({ type: 'undo' })} disabled={!canUndo} className={btn(false, !canUndo)}><Undo2 size={18} /></button>
+        <button type="button" title="Повторить (Ctrl+Y)" onClick={() => dispatch({ type: 'redo' })} disabled={!canRedo} className={btn(false, !canRedo)}><Redo2 size={18} /></button>
+        <button type="button" title="Удалить выделенное (Del)" onClick={() => dispatch({ type: 'delete', ids: state.selectedIds })} disabled={!hasSelection} className={btn(false, !hasSelection)}><Trash2 size={18} /></button>
       </div>
 
-      {/* Grid & Text styles */}
-      <div className="flex items-center gap-2">
-        <button onClick={() => setGridSnap(!gridSnap)} className="p-2 rounded-xl text-gray-600 hover:bg-gray-100" title="Grid">
-          <Grid size={18} />
-        </button>
-        {mode === 'text' && (
-          <>
-            <button onClick={() => updateSelected({ style: { bold: true } })} className="p-1 bg-gray-200 rounded text-sm font-bold">B</button>
-            <button onClick={() => updateSelected({ style: { italic: true } })} className="p-1 bg-gray-200 rounded text-sm italic">I</button>
-          </>
-        )}
-      </div>
+      <div className="h-6 w-px bg-gray-200" />
 
-      {/* File */}
-      <div className="flex items-center gap-2">
-        <button onClick={() => uploadRef.current?.click()} className="p-2 rounded-xl text-gray-600 hover:bg-gray-100 flex items-center gap-1" title="Upload">
-          <Upload size={18} />
-          {image && <div className="w-4 h-4 bg-cover rounded" style={{ backgroundImage: `url(${image})` }} />}
-        </button>
-        <input ref={uploadRef} type="file" accept="image/*" className="hidden" onChange={handleUploadImage} />
+      <button type="button" title="Привязка к сетке 10 px" aria-pressed={state.gridSnap} onClick={() => dispatch({ type: 'setGridSnap', value: !state.gridSnap })} className={btn(state.gridSnap)}>
+        <Grid3x3 size={18} />
+        <span className="text-xs">Сетка</span>
+      </button>
 
-        <button onClick={() => importRef.current?.click()} className="p-2 rounded-xl text-gray-600 hover:bg-gray-100" title="Import">
-          <FileUp size={18} />
-        </button>
-        <input ref={importRef} type="file" accept="application/json" className="hidden" onChange={handleImport} />
-
-        <button onClick={handleExport} className="p-2 rounded-xl bg-emerald-600 text-white hover:bg-emerald-500" title="JSON">
-          <FileDown size={18} />
-        </button>
-
-        <button onClick={exportPNG} className="p-2 rounded-xl bg-green-600 text-white hover:bg-green-500" title="PNG">
-          PNG
-        </button>
-
-        <button onClick={exportSVG} className="p-2 rounded-xl bg-purple-600 text-white hover:bg-purple-500" title="SVG">
-          SVG
-        </button>
-
-        <button onClick={() => { setZones([]); setImage(null); setZoom(1); setPanOffset({ x: 0, y: 0 }); }} className="p-2 rounded-xl bg-red-600 text-white hover:bg-red-500" title="Clear">
-          <Trash2 size={18} />
-        </button>
-      </div>
+      <span className="ml-auto text-xs text-gray-400">Колесо — зум · пробел + тянуть — холст · Shift+клик — несколько зон · стрелки — сдвиг на 1 px</span>
     </div>
-  );
+  )
 }
